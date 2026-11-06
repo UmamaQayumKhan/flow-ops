@@ -1,0 +1,378 @@
+{
+  "name": "Daily Ops Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "40 7 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "711fa8da-d542-0518-3961-5388db4ee93f",
+      "name": "Every Weekday 07:40",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "07:40 rather than 08:00 on purpose: schedulers pile up on the hour.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  COUNT(*)                                            AS total,\n  COUNT(*) FILTER (WHERE escalated)                   AS escalated,\n  COUNT(*) FILTER (WHERE injection_detected)          AS injection_attempts,\n  COUNT(*) FILTER (WHERE priority = 'P1')             AS p1,\n  ROUND(AVG(confidence)::numeric, 3)                  AS avg_confidence,\n  COUNT(DISTINCT workspace_id)                        AS workspaces\nFROM flowops_ticket_log\nWHERE created_at >= $1::timestamptz;",
+        "options": {
+          "queryReplacement": "={{ $now.minus({ hours: 24 }).toISO() }}"
+        }
+      },
+      "id": "0f5ec122-a0a1-76c8-2dc4-9c7d15566a01",
+      "name": "Query Ticket Metrics",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "={{ $credentials.postgres }}",
+          "name": "FlowOps Postgres"
+        }
+      },
+      "notes": "alwaysOutputData: a quiet night returns no rows, and the digest must still send.",
+      "notesInFlow": true,
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT reason, COUNT(*) AS n\nFROM flowops_dead_letter\nWHERE created_at >= $1::timestamptz\nGROUP BY reason ORDER BY n DESC LIMIT 10;",
+        "options": {
+          "queryReplacement": "={{ $now.minus({ hours: 24 }).toISO() }}"
+        }
+      },
+      "id": "edc6f214-d281-b273-d374-c6519839f608",
+      "name": "Query Dead Letters",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        470
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "={{ $credentials.postgres }}",
+          "name": "FlowOps Postgres"
+        }
+      },
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "multiplex",
+        "options": {}
+      },
+      "id": "e6aa2765-51fa-c1b4-7481-8fe14a7d9d7d",
+      "name": "Combine Metrics",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsLanguage": "javaScript",
+        "jsCode": "// Collapse both queries into one compact object for the model.\nconst items = $input.all().map((i) => i.json);\nconst metrics = items.find((i) => i.total !== undefined) ?? {};\nconst deadLetters = items.filter((i) => i.reason !== undefined);\n\nconst total = Number(metrics.total ?? 0);\nconst escalated = Number(metrics.escalated ?? 0);\n\nreturn [{ json: {\n  window: '24h',\n  generatedAt: new Date().toISOString(),\n  total,\n  escalated,\n  escalationRate: total ? Number((escalated / total).toFixed(3)) : 0,\n  injectionAttempts: Number(metrics.injection_attempts ?? 0),\n  p1: Number(metrics.p1 ?? 0),\n  avgConfidence: Number(metrics.avg_confidence ?? 0),\n  workspaces: Number(metrics.workspaces ?? 0),\n  deadLetters,\n  deadLetterTotal: deadLetters.reduce((a, d) => a + Number(d.n ?? 0), 0),\n  quietNight: total === 0,\n} }];"
+      },
+      "id": "f2116680-c76f-a064-ee2b-bc0468d516ba",
+      "name": "Shape Digest Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Write a short operations digest from this JSON. Lead with anything that needs action today, then the numbers. Four sentences maximum. State only what is in the data; if a field is zero, say so rather than omitting it. No preamble.\n\n{{ JSON.stringify($json, null, 2) }}"
+      },
+      "id": "047367a2-592e-9a9a-b898-cd7fb2318c78",
+      "name": "Summarise",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        880,
+        300
+      ],
+      "notes": "A plain LLM chain, not an agent: there is nothing to decide and no tool to call.",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "model": "llama-3.3-70b-versatile",
+        "options": {
+          "temperature": 0.1
+        }
+      },
+      "id": "c576bcbf-11f0-f625-da86-f4cdf0dbacae",
+      "name": "Groq Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        880,
+        640
+      ],
+      "credentials": {
+        "groqApi": {
+          "id": "={{ $credentials.groqApi }}",
+          "name": "Groq account"
+        }
+      },
+      "notes": "Free tier. Swap for lmChatGoogleGemini or lmChatOpenAi without touching the agent.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#ops-daily",
+          "mode": "name"
+        },
+        "text": "=*Ops digest \u2014 {{ $('Shape Digest Input').item.json.generatedAt.slice(0,10) }}*\n\n{{ $json.text }}\n\n```tickets {{ $('Shape Digest Input').item.json.total }} \u00b7 escalated {{ $('Shape Digest Input').item.json.escalated }} ({{ ($('Shape Digest Input').item.json.escalationRate * 100).toFixed(1) }}%) \u00b7 P1 {{ $('Shape Digest Input').item.json.p1 }} \u00b7 injection attempts {{ $('Shape Digest Input').item.json.injectionAttempts }} \u00b7 dead letters {{ $('Shape Digest Input').item.json.deadLetterTotal }}```",
+        "otherOptions": {}
+      },
+      "id": "93863c53-d680-948c-7dcb-7e131abc9d81",
+      "name": "Post To Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
+        300
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "={{ $credentials.slackApi }}",
+          "name": "Slack account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "ops@northwind.cloud",
+        "subject": "=Ops digest {{ $('Shape Digest Input').item.json.generatedAt.slice(0,10) }}",
+        "emailType": "text",
+        "message": "={{ $json.text }}\n\n---\nRaw metrics:\n{{ JSON.stringify($('Shape Digest Input').item.json, null, 2) }}",
+        "options": {}
+      },
+      "id": "472fe529-cc70-ac00-5226-1875875e57a2",
+      "name": "Email Digest",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1100,
+        470
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "={{ $credentials.gmail }}",
+          "name": "Gmail account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {},
+      "id": "7a3eb7f2-a18f-5d71-e658-f2a2bbbf6374",
+      "name": "On Workflow Error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -210
+      ],
+      "notes": "Separate entry point. Fires on any unhandled node failure.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#ops-alerts",
+          "mode": "name"
+        },
+        "text": "=:rotating_light: *{{ $json.workflow.name }}* failed\nNode: `{{ $json.execution.lastNodeExecuted }}`\nError: {{ $json.execution.error.message }}\nExecution: {{ $json.execution.url }}",
+        "otherOptions": {}
+      },
+      "id": "ee5964e2-f950-6e98-56ec-8083c2af39d5",
+      "name": "Alert On-Call",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        220,
+        -210
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "={{ $credentials.slackApi }}",
+          "name": "Slack account"
+        }
+      },
+      "notes": "Retries: losing the alert about a failure is worse than the failure.",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3
+    }
+  ],
+  "connections": {
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Summarise",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every Weekday 07:40": {
+      "main": [
+        [
+          {
+            "node": "Query Ticket Metrics",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Query Dead Letters",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Ticket Metrics": {
+      "main": [
+        [
+          {
+            "node": "Combine Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Dead Letters": {
+      "main": [
+        [
+          {
+            "node": "Combine Metrics",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Combine Metrics": {
+      "main": [
+        [
+          {
+            "node": "Shape Digest Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shape Digest Input": {
+      "main": [
+        [
+          {
+            "node": "Summarise",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarise": {
+      "main": [
+        [
+          {
+            "node": "Post To Slack",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Email Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "On Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Alert On-Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "pinData": {},
+  "meta": {
+    "description": "Scheduled: pull overnight ticket and error metrics, summarise with an LLM, deliver to Slack and email with the raw numbers attached."
+  },
+  "tags": [
+    {
+      "name": "ai"
+    },
+    {
+      "name": "reporting"
+    },
+    {
+      "name": "scheduled"
+    }
+  ],
+  "versionId": "26180719-feac-7ba9-cc89-8f8a4413d9bc"
+}

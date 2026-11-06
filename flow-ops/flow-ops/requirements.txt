@@ -1,0 +1,4 @@
+# stdio MCP mode needs nothing at all -- the JSON-RPC layer is stdlib only.
+# These are for the HTTP/SSE transport that n8n connects to.
+fastapi>=0.115
+uvicorn[standard]>=0.30

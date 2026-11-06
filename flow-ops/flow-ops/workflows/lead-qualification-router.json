@@ -1,0 +1,698 @@
+{
+  "name": "Lead Qualification Router",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead",
+        "responseMode": "lastNode",
+        "options": {},
+        "authentication": "headerAuth"
+      },
+      "id": "8f1ce98e-abfc-3572-1e00-bf5d37d7386e",
+      "name": "Form Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "={{ $credentials.webhookAuth }}",
+          "name": "FlowOps webhook token"
+        }
+      },
+      "webhookId": "flowops-lead-intake"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsLanguage": "javaScript",
+        "jsCode": "const b = $input.item.json.body ?? $input.item.json;\nconst email = String(b.email ?? '').trim().toLowerCase();\nconst domain = email.includes('@') ? email.split('@')[1] : null;\n\n// Free-mail domains are not companies; flag rather than drop, since a founder\n// using a personal address is still a lead.\nconst freeMail = ['gmail.com','yahoo.com','hotmail.com','outlook.com','icloud.com','proton.me'];\n\nreturn { json: {\n  email,\n  domain,\n  isFreeMail: domain ? freeMail.includes(domain) : true,\n  emailValid: /^[^@\\s]+@[^@\\s]+\\.[^@\\s]{2,}$/.test(email),\n  name: String(b.name ?? '').trim(),\n  company: String(b.company ?? '').trim(),\n  jobTitle: String(b.jobTitle ?? b.title ?? '').trim(),\n  teamSize: Number(b.teamSize ?? 0),\n  useCase: String(b.useCase ?? b.message ?? '').slice(0, 2000),\n  source: String(b.source ?? 'website'),\n  receivedAt: new Date().toISOString(),\n} };"
+      },
+      "id": "a4a89f45-5cdd-83a8-3f4d-490d08e27bc3",
+      "name": "Normalise Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.emailValid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "36036631-b8b0-60d6-bb73-b5cf37415fcc",
+      "name": "Valid Email?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        300
+      ],
+      "notes": "Cheapest possible filter first: never spend an enrichment credit or an LLM call on a malformed address.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.company-enrichment.example/v1/domain/{{ $json.domain }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 10000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "12c89744-3273-8bd9-3abf-a67fc657abbf",
+      "name": "Enrich Company",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "={{ $credentials.enrichmentApi }}",
+          "name": "Enrichment API"
+        }
+      },
+      "notes": "neverError + continueOnFail: an enrichment outage must downgrade scoring, not drop the lead.",
+      "notesInFlow": true,
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Lead:\n{{ JSON.stringify($('Normalise Lead').item.json, null, 2) }}\n\nEnrichment (may be empty if the provider failed):\n{{ JSON.stringify($json, null, 2) }}",
+        "options": {
+          "systemMessage": "You score inbound leads for Northwind Cloud against a fixed rubric. Do not invent facts about the company; if enrichment is empty, score on the form data alone and lower your confidence.\n\nRubric, 0-100:\n  team size 25+ or enterprise signals ........ up to 30\n  decision-making job title .................. up to 25\n  use case matches our product ............... up to 30\n  business email domain ...................... up to 15\n\nReturn JSON only:\n{\n  \"score\": 0-100,\n  \"band\": \"hot|warm|cold|disqualified\",\n  \"rationale\": \"two sentences citing the rubric lines you used\",\n  \"suggestedOwner\": \"enterprise|smb|self_serve\",\n  \"confidence\": 0.0-1.0\n}\n\nband: hot >= 70, warm 40-69, cold 15-39, disqualified < 15 or clearly a student, job seeker or competitor.",
+          "maxIterations": 3
+        }
+      },
+      "id": "06705a84-3adc-815c-51c1-4aa6b621a4ce",
+      "name": "Score Fit",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        880,
+        300
+      ],
+      "notes": "The rubric lives in the prompt and the thresholds are checked in code below.",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "model": "llama-3.3-70b-versatile",
+        "options": {
+          "temperature": 0.1
+        }
+      },
+      "id": "a4f1ed5d-529a-570f-5c99-e6e437c1ef3d",
+      "name": "Groq Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        880,
+        640
+      ],
+      "credentials": {
+        "groqApi": {
+          "id": "={{ $credentials.groqApi }}",
+          "name": "Groq account"
+        }
+      },
+      "notes": "Free tier. Swap for lmChatGoogleGemini or lmChatOpenAi without touching the agent.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsLanguage": "javaScript",
+        "jsCode": "// Validate the model's structured output before acting on it.\nconst required = [\"score\", \"band\", \"rationale\"];\nconst out = $input.item.json;\nconst payload = out.output ?? out.message?.content ?? out;\n\nconst missing = required.filter((k) => payload[k] === undefined || payload[k] === null || payload[k] === '');\nconst valid = missing.length === 0;\n\nreturn {\n  json: {\n    ...payload,\n    _valid: valid,\n    _missing: missing,\n    _validatedAt: new Date().toISOString(),\n    _raw: valid ? undefined : JSON.stringify(out).slice(0, 2000),\n  },\n};"
+      },
+      "id": "77b79c70-a05a-94b6-7ffb-8a810f52e23b",
+      "name": "Validate Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        300
+      ],
+      "notes": "Fails closed: sets _valid=false and keeps the raw output when ['score', 'band', 'rationale'] is incomplete.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsLanguage": "javaScript",
+        "jsCode": "// Recompute the band from the score. The model is allowed to score;\n// it is not allowed to decide the threshold, because a band drives routing\n// and an off-by-one band sends an enterprise lead to self-serve.\nconst j = $input.item.json;\nconst score = Math.max(0, Math.min(100, Number(j.score ?? 0)));\n\nlet band = 'disqualified';\nif (score >= 70) band = 'hot';\nelse if (score >= 40) band = 'warm';\nelse if (score >= 15) band = 'cold';\n\nreturn { json: {\n  ...j,\n  score,\n  band,\n  bandCorrected: band !== j.band,\n  modelBand: j.band,\n} };"
+      },
+      "id": "4f577e3c-e127-3d10-8775-4bdb3b3671e9",
+      "name": "Enforce Band Thresholds",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ],
+      "notes": "Deterministic re-derivation. bandCorrected shows how often the model disagreed.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.band }}",
+                    "rightValue": "hot",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "hot"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.band }}",
+                    "rightValue": "warm",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "warm"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "cold_or_dq"
+        }
+      },
+      "id": "5f9357dc-4506-11bc-c780-4ad9a4c91221",
+      "name": "Route By Band",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#sales-hot-leads",
+          "mode": "name"
+        },
+        "text": "=:fire: *Hot lead \u2014 {{ $json.score }}/100*\n{{ $('Normalise Lead').item.json.name }} \u00b7 {{ $('Normalise Lead').item.json.jobTitle }} @ {{ $('Normalise Lead').item.json.company }}\n{{ $('Normalise Lead').item.json.email }} \u00b7 team {{ $('Normalise Lead').item.json.teamSize }}\n*Owner* {{ $json.suggestedOwner }}\n_{{ $json.rationale }}_",
+        "otherOptions": {}
+      },
+      "id": "ea7e4e7a-47de-c2d4-68bf-7a443728e0cc",
+      "name": "Alert Sales",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1760,
+        130
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "={{ $credentials.slackApi }}",
+          "name": "Slack account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $credentials.nurtureSheetId }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Nurture",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [
+            "email"
+          ],
+          "value": {
+            "email": "={{ $('Normalise Lead').item.json.email }}",
+            "name": "={{ $('Normalise Lead').item.json.name }}",
+            "company": "={{ $('Normalise Lead').item.json.company }}",
+            "score": "={{ $json.score }}",
+            "band": "={{ $json.band }}",
+            "rationale": "={{ $json.rationale }}",
+            "added_at": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "66f8e526-08e3-2f62-7f16-c72e88179933",
+      "name": "Add To Nurture",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1760,
+        470
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "={{ $credentials.googleSheets }}",
+          "name": "Google Sheets account"
+        }
+      },
+      "notes": "appendOrUpdate keyed on email, so a resubmitted form updates instead of duplicating.",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "schema": {
+          "__rl": true,
+          "value": "public",
+          "mode": "name"
+        },
+        "table": {
+          "__rl": true,
+          "value": "flowops_leads",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [
+            "email"
+          ],
+          "value": {
+            "email": "={{ $('Normalise Lead').item.json.email }}",
+            "company": "={{ $('Normalise Lead').item.json.company }}",
+            "domain": "={{ $('Normalise Lead').item.json.domain }}",
+            "score": "={{ $json.score }}",
+            "band": "={{ $json.band }}",
+            "band_corrected": "={{ $json.bandCorrected }}",
+            "owner": "={{ $json.suggestedOwner }}",
+            "source": "={{ $('Normalise Lead').item.json.source }}",
+            "updated_at": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "33ef7e27-4875-fb3d-a2e0-fe4ae1b81e01",
+      "name": "Upsert CRM Record",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1980,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "={{ $credentials.postgres }}",
+          "name": "FlowOps Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": {
+          "__rl": true,
+          "value": "public",
+          "mode": "name"
+        },
+        "table": {
+          "__rl": true,
+          "value": "flowops_leads_archive",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "email": "={{ $('Normalise Lead').item.json.email }}",
+            "score": "={{ $json.score }}",
+            "band": "={{ $json.band }}",
+            "rationale": "={{ $json.rationale }}",
+            "created_at": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "bf5d1275-6454-1768-b47e-a256532d048c",
+      "name": "Archive Cold Lead",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1760,
+        640
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "={{ $credentials.postgres }}",
+          "name": "FlowOps Postgres"
+        }
+      },
+      "notes": "Cold is archived, not deleted: today's cold lead is next year's enterprise deal.",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": {
+          "__rl": true,
+          "value": "public",
+          "mode": "name"
+        },
+        "table": {
+          "__rl": true,
+          "value": "flowops_dead_letter",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "workflow": "={{ $workflow.name }}",
+            "execution_id": "={{ $execution.id }}",
+            "reason": "={{ $json._missing ? 'invalid_ai_output: ' + $json._missing.join(',') : 'validation_failed' }}",
+            "payload": "={{ JSON.stringify($json) }}",
+            "created_at": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "eb1d7bab-23ff-d93e-dacb-9db5124afd53",
+      "name": "Dead Letter Queue",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1320,
+        -40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "={{ $credentials.postgres }}",
+          "name": "FlowOps Postgres"
+        }
+      },
+      "notes": "Retries, because a dead-letter write that fails loses the item entirely.",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {},
+      "id": "4ba7cb99-9866-11fb-b5c0-1444b7b6e518",
+      "name": "On Workflow Error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -210
+      ],
+      "notes": "Separate entry point. Fires on any unhandled node failure.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#ops-alerts",
+          "mode": "name"
+        },
+        "text": "=:rotating_light: *{{ $json.workflow.name }}* failed\nNode: `{{ $json.execution.lastNodeExecuted }}`\nError: {{ $json.execution.error.message }}\nExecution: {{ $json.execution.url }}",
+        "otherOptions": {}
+      },
+      "id": "1ae454ce-874f-fb3f-297c-cf8efc8fa07b",
+      "name": "Alert On-Call",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        220,
+        -210
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "={{ $credentials.slackApi }}",
+          "name": "Slack account"
+        }
+      },
+      "notes": "Retries: losing the alert about a failure is worse than the failure.",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3
+    }
+  ],
+  "connections": {
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Score Fit",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Form Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalise Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise Lead": {
+      "main": [
+        [
+          {
+            "node": "Valid Email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid Email?": {
+      "main": [
+        [
+          {
+            "node": "Enrich Company",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich Company": {
+      "main": [
+        [
+          {
+            "node": "Score Fit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score Fit": {
+      "main": [
+        [
+          {
+            "node": "Validate Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Score": {
+      "main": [
+        [
+          {
+            "node": "Enforce Band Thresholds",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Dead Letter Queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enforce Band Thresholds": {
+      "main": [
+        [
+          {
+            "node": "Route By Band",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route By Band": {
+      "main": [
+        [
+          {
+            "node": "Alert Sales",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Add To Nurture",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Archive Cold Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Sales": {
+      "main": [
+        [
+          {
+            "node": "Upsert CRM Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add To Nurture": {
+      "main": [
+        [
+          {
+            "node": "Upsert CRM Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Archive Cold Lead": {
+      "main": [
+        [
+          {
+            "node": "Upsert CRM Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "On Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Alert On-Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "pinData": {},
+  "meta": {
+    "description": "Inbound form \u2192 company enrichment \u2192 AI fit scoring against an explicit rubric \u2192 routed to sales, nurture or disqualified, with the CRM updated."
+  },
+  "tags": [
+    {
+      "name": "ai"
+    },
+    {
+      "name": "sales"
+    }
+  ],
+  "versionId": "e457e866-c5d0-5567-f4b0-489abd8b27c0"
+}

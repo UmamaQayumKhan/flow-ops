@@ -1,0 +1,18 @@
+FROM python:3.12-slim
+
+RUN useradd --create-home --uid 10001 mcp
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app/src
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ ./src/
+COPY data/ ./data/
+
+RUN chown -R mcp:mcp /app
+USER mcp
+
+EXPOSE 8080
+
+CMD ["python", "-m", "flowops.mcp_server", "--http", "--host", "0.0.0.0", "--port", "8080"]

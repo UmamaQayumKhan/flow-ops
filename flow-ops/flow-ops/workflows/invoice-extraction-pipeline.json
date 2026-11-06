@@ -1,0 +1,518 @@
+{
+  "name": "Invoice Extraction Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "invoice",
+        "responseMode": "lastNode",
+        "options": {
+          "binaryPropertyName": "invoice",
+          "rawBody": false
+        },
+        "authentication": "headerAuth"
+      },
+      "id": "969d74b5-91b0-384c-adb2-2e48ea058728",
+      "name": "Invoice Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "={{ $credentials.webhookAuth }}",
+          "name": "FlowOps webhook token"
+        }
+      },
+      "webhookId": "flowops-invoice-intake"
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "invoice",
+        "options": {}
+      },
+      "id": "8d479817-ef59-13fc-f36a-ee4474a2a41c",
+      "name": "Extract PDF Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        220,
+        300
+      ],
+      "notes": "Deterministic text extraction first. Sending the raw PDF to a model costs more and reads worse.",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ ($json.text || '').trim().length }}",
+              "rightValue": 40,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4e82e6d7-09af-0bb8-76e5-5ceaf77b3f89",
+      "name": "Text Extracted?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        300
+      ],
+      "notes": "A scanned invoice yields no text. Route it to a human instead of asking a model to guess.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "text": "={{ $json.text }}",
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"invoiceNumber\": { \"type\": \"string\" },\n    \"vendorName\":    { \"type\": \"string\" },\n    \"vendorTaxId\":   { \"type\": \"string\" },\n    \"issueDate\":     { \"type\": \"string\", \"description\": \"ISO 8601 date\" },\n    \"dueDate\":       { \"type\": \"string\", \"description\": \"ISO 8601 date\" },\n    \"currency\":      { \"type\": \"string\", \"description\": \"ISO 4217 code\" },\n    \"subtotal\":      { \"type\": \"number\" },\n    \"taxAmount\":     { \"type\": \"number\" },\n    \"total\":         { \"type\": \"number\" },\n    \"lineItems\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"description\": { \"type\": \"string\" },\n          \"quantity\":    { \"type\": \"number\" },\n          \"unitPrice\":   { \"type\": \"number\" },\n          \"amount\":      { \"type\": \"number\" }\n        }\n      }\n    }\n  },\n  \"required\": [\"invoiceNumber\", \"vendorName\", \"total\", \"currency\"]\n}",
+        "options": {
+          "systemPromptTemplate": "Extract invoice fields from the text. Use only values present in the document. If a field is absent, omit it rather than guessing. Return numbers as numbers, not strings, and strip currency symbols and thousands separators."
+        }
+      },
+      "id": "31c355a1-cfcf-a71f-f8aa-903081d97e11",
+      "name": "Extract Invoice Fields",
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1,
+      "position": [
+        660,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "model": "llama-3.3-70b-versatile",
+        "options": {
+          "temperature": 0.1
+        }
+      },
+      "id": "0c7972eb-9e5c-ab3f-1f4d-feac06f40fb3",
+      "name": "Groq Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        660,
+        640
+      ],
+      "credentials": {
+        "groqApi": {
+          "id": "={{ $credentials.groqApi }}",
+          "name": "Groq account"
+        }
+      },
+      "notes": "Free tier. Swap for lmChatGoogleGemini or lmChatOpenAi without touching the agent.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsLanguage": "javaScript",
+        "jsCode": "// The model reads the document; code checks the maths.\n// LLMs transpose digits and mis-handle thousands separators, and an invoice\n// that books with the wrong total is a reconciliation problem for months.\nconst j = $input.item.json.output ?? $input.item.json;\nconst problems = [];\n\nconst num = (v) => (v === undefined || v === null || v === '' ? null : Number(v));\nconst subtotal = num(j.subtotal);\nconst tax = num(j.taxAmount);\nconst total = num(j.total);\nconst items = Array.isArray(j.lineItems) ? j.lineItems : [];\n\nif (total === null || Number.isNaN(total)) problems.push('total_missing_or_not_a_number');\nif (total !== null && total <= 0) problems.push('total_not_positive');\n\n// subtotal + tax must equal total, to the cent\nif (subtotal !== null && tax !== null && total !== null) {\n  if (Math.abs(subtotal + tax - total) > 0.01) {\n    problems.push(`totals_do_not_reconcile: ${subtotal} + ${tax} != ${total}`);\n  }\n}\n\n// line items must sum to the subtotal\nif (items.length && subtotal !== null) {\n  const sum = items.reduce((a, it) => a + (num(it.amount) ?? 0), 0);\n  if (Math.abs(sum - subtotal) > 0.01) {\n    problems.push(`line_items_do_not_sum: ${sum.toFixed(2)} != ${subtotal}`);\n  }\n  for (const [i, it] of items.entries()) {\n    const q = num(it.quantity), p = num(it.unitPrice), a = num(it.amount);\n    if (q !== null && p !== null && a !== null && Math.abs(q * p - a) > 0.01) {\n      problems.push(`line_${i}_amount_mismatch`);\n    }\n  }\n}\n\nif (!/^[A-Z]{3}$/.test(String(j.currency ?? ''))) problems.push('currency_not_iso4217');\nif (!j.invoiceNumber) problems.push('invoice_number_missing');\nif (!j.vendorName) problems.push('vendor_missing');\n\nconst isoDate = (d) => !d || /^\\d{4}-\\d{2}-\\d{2}/.test(String(d));\nif (!isoDate(j.issueDate)) problems.push('issue_date_not_iso');\nif (!isoDate(j.dueDate)) problems.push('due_date_not_iso');\nif (j.issueDate && j.dueDate && new Date(j.dueDate) < new Date(j.issueDate)) {\n  problems.push('due_date_before_issue_date');\n}\n\n// Large invoices get a human regardless of how clean the extraction looks.\nconst needsReview = total !== null && total >= 10000;\nif (needsReview) problems.push('above_auto_post_threshold');\n\nreturn { json: {\n  ...j,\n  subtotal, taxAmount: tax, total,\n  lineItemCount: items.length,\n  _problems: problems,\n  _valid: problems.length === 0,\n  _needsReview: needsReview,\n  _validatedAt: new Date().toISOString(),\n} };"
+      },
+      "id": "2afedc98-cdee-e924-222d-2042249b31bd",
+      "name": "Validate Arithmetic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ],
+      "notes": "Six independent arithmetic and format checks. The model is never the last word on money.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "41c2a6f4-e83b-a6be-2b31-d952ee0b792e",
+      "name": "Clean Extraction?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "schema": {
+          "__rl": true,
+          "value": "public",
+          "mode": "name"
+        },
+        "table": {
+          "__rl": true,
+          "value": "flowops_invoices",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [
+            "invoice_number",
+            "vendor_name"
+          ],
+          "value": {
+            "invoice_number": "={{ $json.invoiceNumber }}",
+            "vendor_name": "={{ $json.vendorName }}",
+            "vendor_tax_id": "={{ $json.vendorTaxId }}",
+            "issue_date": "={{ $json.issueDate }}",
+            "due_date": "={{ $json.dueDate }}",
+            "currency": "={{ $json.currency }}",
+            "subtotal": "={{ $json.subtotal }}",
+            "tax_amount": "={{ $json.taxAmount }}",
+            "total": "={{ $json.total }}",
+            "line_item_count": "={{ $json.lineItemCount }}",
+            "execution_id": "={{ $execution.id }}",
+            "created_at": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "13a20d85-b36a-bf59-f89c-de64236ad66a",
+      "name": "Post To Ledger",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1320,
+        130
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "={{ $credentials.postgres }}",
+          "name": "FlowOps Postgres"
+        }
+      },
+      "notes": "Upsert on (invoice_number, vendor): the same invoice emailed twice must not book twice.",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $credentials.exceptionsSheetId }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Exceptions",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "invoice_number": "={{ $json.invoiceNumber || 'UNKNOWN' }}",
+            "vendor": "={{ $json.vendorName || 'UNKNOWN' }}",
+            "total": "={{ $json.total }}",
+            "problems": "={{ ($json._problems || []).join('; ') }}",
+            "execution_id": "={{ $execution.id }}",
+            "queued_at": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "29d76094-faea-0f8f-b7f0-bd686ac4cff5",
+      "name": "Exception Queue",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1320,
+        470
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "={{ $credentials.googleSheets }}",
+          "name": "Google Sheets account"
+        }
+      },
+      "notes": "Every failed check lands here with the specific reason, ready for a human.",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#finance-ap",
+          "mode": "name"
+        },
+        "text": "=:page_facing_up: Invoice needs review \u2014 *{{ $json.vendorName || 'unknown vendor' }}* {{ $json.invoiceNumber || '' }} {{ $json.currency }} {{ $json.total }}\nProblems: `{{ ($json._problems || []).join(', ') }}`",
+        "otherOptions": {}
+      },
+      "id": "881a7a61-a8b3-53f0-30f1-2a888064b9e0",
+      "name": "Notify AP",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1540,
+        470
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "={{ $credentials.slackApi }}",
+          "name": "Slack account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#finance-ap",
+          "mode": "name"
+        },
+        "text": "=:mag: Invoice could not be read automatically (no extractable text \u2014 likely a scan). Execution {{ $execution.id }} needs manual entry.",
+        "otherOptions": {}
+      },
+      "id": "ad82420a-fded-1c84-c042-5910b079f0e5",
+      "name": "Queue For Manual Entry",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        -40
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "={{ $credentials.slackApi }}",
+          "name": "Slack account"
+        }
+      },
+      "notes": "An unreadable invoice must reach a human even if Slack blips.",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {},
+      "id": "e701b10a-048e-4f15-3106-206ac98f0fc0",
+      "name": "On Workflow Error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -380
+      ],
+      "notes": "Separate entry point. Fires on any unhandled node failure.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#ops-alerts",
+          "mode": "name"
+        },
+        "text": "=:rotating_light: *{{ $json.workflow.name }}* failed\nNode: `{{ $json.execution.lastNodeExecuted }}`\nError: {{ $json.execution.error.message }}\nExecution: {{ $json.execution.url }}",
+        "otherOptions": {}
+      },
+      "id": "ee060c57-dd04-e671-c604-9999b8af8d8c",
+      "name": "Alert On-Call",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        220,
+        -380
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "={{ $credentials.slackApi }}",
+          "name": "Slack account"
+        }
+      },
+      "notes": "Retries: losing the alert about a failure is worse than the failure.",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3
+    }
+  ],
+  "connections": {
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Extract Invoice Fields",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Invoice Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract PDF Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract PDF Text": {
+      "main": [
+        [
+          {
+            "node": "Text Extracted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Text Extracted?": {
+      "main": [
+        [
+          {
+            "node": "Extract Invoice Fields",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Queue For Manual Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Invoice Fields": {
+      "main": [
+        [
+          {
+            "node": "Validate Arithmetic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Arithmetic": {
+      "main": [
+        [
+          {
+            "node": "Clean Extraction?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean Extraction?": {
+      "main": [
+        [
+          {
+            "node": "Post To Ledger",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Exception Queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Exception Queue": {
+      "main": [
+        [
+          {
+            "node": "Notify AP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "On Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Alert On-Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "pinData": {},
+  "meta": {
+    "description": "Invoice PDF \u2192 text extraction \u2192 LLM structured extraction \u2192 arithmetic validation in code \u2192 ledger or exception queue."
+  },
+  "tags": [
+    {
+      "name": "ai"
+    },
+    {
+      "name": "finance"
+    },
+    {
+      "name": "document-ai"
+    }
+  ],
+  "versionId": "8001a7ac-e137-4f22-029e-cc5dd30d7bba"
+}
